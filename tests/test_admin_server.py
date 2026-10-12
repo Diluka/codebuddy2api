@@ -1,10 +1,14 @@
+import asyncio
 import json
 import tempfile
+import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import httpx
+from fastapi import HTTPException
 
 import admin.server as admin_server
 
@@ -18,6 +22,13 @@ def credential(uid="one", name="测试账号"):
 
 class AdminTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # Model-list fallback must never send these synthetic credentials upstream.
+        catalog_patch = patch.object(admin_server.model_catalog_manager, "get", side_effect=RuntimeError("synthetic remote unavailable"))
+        catalog_patch.start()
+        self.addCleanup(catalog_patch.stop)
+        local_patch = patch.object(admin_server.converter, "_load_models_from_workbuddy", return_value=[])
+        local_patch.start()
+        self.addCleanup(local_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.auth = self.root / "auth"
@@ -74,6 +85,102 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(accounts), 1)
         self.assertTrue(accounts[0]["active"])
         self.assertEqual(accounts[0]["name"], "Primary")
+
+    async def test_model_catalog_auth_and_selected_account(self):
+        store = self.app.state.store
+        selected = admin_server.converter.CONFIG["cred"]
+        loop_thread = threading.get_ident()
+
+        def lookup(credential, force=False):
+            self.assertIs(credential, selected)
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            self.assertTrue(store.lock.acquire(timeout=0.2))
+            store.lock.release()
+            return {"models": []}
+
+        with patch.object(admin_server.model_catalog_manager, "get", side_effect=lookup) as get:
+            self.assertEqual((await self.client.get("/admin/api/models")).status_code, 401)
+            self.assertEqual((await self.client.get("/admin/api/models", headers={"Authorization": "Bearer " + API})).status_code, 401)
+            self.assertEqual((await self.client.post("/admin/api/models/refresh")).status_code, 401)
+            get.assert_not_called()
+            await self.login()
+            aid = store.data["active"]
+            for method, path, force in (("GET", "/admin/api/models", False), ("POST", "/admin/api/models/refresh", True)):
+                response = await self.client.request(method, path)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {"models": [], "account": {"id": aid, "name": store.data["accounts"][aid]["name"]}})
+                get.assert_called_once_with(selected, force=force)
+                get.reset_mock()
+            self.client.headers.pop("X-CSRF-Token")
+            self.assertEqual((await self.client.post("/admin/api/models/refresh")).status_code, 403)
+            get.assert_not_called()
+
+    async def test_model_catalog_requires_unchanged_enabled_account(self):
+        await self.login()
+        store = self.app.state.store
+        aid = store.data["active"]
+        with patch.object(admin_server.model_catalog_manager, "get") as get:
+            store.data["active"] = None
+            self.assertEqual((await self.client.get("/admin/api/models")).status_code, 400)
+            store.data["active"] = aid
+            store.data["accounts"][aid]["enabled"] = False
+            self.assertEqual((await self.client.get("/admin/api/models")).status_code, 400)
+            get.assert_not_called()
+        store.data["accounts"][aid]["enabled"] = True
+
+        for failed in (False, True):
+            with self.subTest(upstream_failed=failed):
+                store.data["active"] = aid
+
+                def lookup(credential, force=False):
+                    with store.lock:
+                        store.data["active"] = None
+                    if failed:
+                        raise HTTPException(502, "remote unavailable")
+                    return {"models": [{"id": "remote-model"}]}
+
+                with patch.object(admin_server.model_catalog_manager, "get", side_effect=lookup):
+                    response = await self.client.get("/admin/api/models")
+                self.assertEqual(response.status_code, 400)
+                self.assertNotIn("remote-model", response.text)
+
+    async def test_model_lookup_pins_account_and_rejects_switch(self):
+        await self.login()
+        selected = admin_server.converter.CONFIG["cred"]
+
+        def switch_before_remote_lookup():
+            admin_server.converter.CONFIG["cred"] = None
+            return []
+
+        result = {"models": [{"id": "remote-model"}], "stale": False, "error": None}
+        with patch.object(admin_server.converter, "_load_models_from_workbuddy", side_effect=switch_before_remote_lookup), \
+                patch.object(admin_server.model_catalog_manager, "get", return_value=result) as get:
+            for method, path in (("GET", "/admin/api/overview"), ("POST", "/admin/api/test")):
+                admin_server.converter.CONFIG["cred"] = selected
+                response = await self.client.request(method, path, json={"model": "remote-model", "prompt": "test"})
+                self.assertEqual(response.status_code, 409)
+                get.assert_called_once_with(selected)
+                get.reset_mock()
+        self.assertEqual(list(self.app.state.store.events), [])
+
+    async def test_concurrent_test_started_during_lookup_is_rejected_without_queueing(self):
+        await self.login()
+        loop = asyncio.get_running_loop()
+        test_lock = self.app.state.store.test_lock
+
+        def lookup(credential):
+            asyncio.run_coroutine_threadsafe(test_lock.acquire(), loop).result(timeout=1)
+            return {"models": [{"id": "remote-model"}], "stale": False, "error": None}
+
+        try:
+            with patch.object(admin_server.model_catalog_manager, "get", side_effect=lookup):
+                response = await asyncio.wait_for(
+                    self.client.post("/admin/api/test", json={"model": "remote-model", "prompt": "test"}), timeout=2)
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(list(self.app.state.store.events), [])
+        finally:
+            if test_lock.locked():
+                test_lock.release()
 
     async def test_key_revocation_persists_and_no_secret_leak(self):
         await self.login()

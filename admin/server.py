@@ -18,8 +18,9 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
 from .browser_login import BrowserLogin
-from .pool import AccountPool, PoolMiddleware
+from .pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL
 from .metrics import RequestMetrics, MetricsMiddleware
+from core.model_catalog import model_catalog_manager
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
@@ -159,6 +160,22 @@ class Store:
             if aid not in self.managers:
                 self.managers[aid] = converter.CredentialManager(self.file_for(item))
             return self.managers[aid]
+
+    def model_account(self):
+        with self.lock:
+            aid = self.data.get("active")
+            item = self.data["accounts"].get(aid)
+            if not item:
+                raise HTTPException(400, "请先在账号池选定“手动 / 测试”账号")
+            if not item.get("enabled"):
+                raise HTTPException(400, "选定的“手动 / 测试”账号已暂停")
+            return aid, dict(item), self.manager_for(aid, item)
+
+    def check_model_account(self, aid, item, credential):
+        current, current_item, current_credential = self.model_account()
+        if current != aid or current_item.get("file") != item.get("file") or current_credential is not credential:
+            raise HTTPException(400, "查询账号已切换，请重新加载模型信息")
+        return {"id": aid, "name": current_item["name"]}
 
     def account_rows(self):
         result = []
@@ -373,8 +390,26 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def overview(req: Request):
         store.require_admin(req)
         with store.lock:
+            credential = converter.CONFIG.get("cred")
+        with model_catalog_manager.use_credential(credential):
+            models = await asyncio.to_thread(converter.get_available_models)
+        with store.lock:
+            if converter.CONFIG.get("cred") is not credential:
+                raise HTTPException(409, "查询账号已切换，请重新加载")
             keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": models, "uptime": int(time.time() - store.started), "events": list(store.events)}
+
+    @app.get("/admin/api/models")
+    @app.post("/admin/api/models/refresh")
+    async def remote_models(req: Request):
+        store.require_admin(req)
+        aid, item, credential = store.model_account()
+        try:
+            result = await asyncio.to_thread(model_catalog_manager.get, credential, force=req.method == "POST")
+        finally:
+            # Reject a changed selection even when the remote query itself failed.
+            account = store.check_model_account(aid, item, credential)
+        return {**result, "account": account}
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
@@ -515,20 +550,31 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         model = body.get("model", "deepseek-v4-flash")
         prompt = body.get("prompt", "请只回复：连接成功")
-        if not isinstance(model, str) or model not in converter.get_available_models():
+        if not isinstance(model, str):
             raise HTTPException(400, "请选择列表中的模型")
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 2000:
             raise HTTPException(400, "测试消息需为 1–2000 个字符")
         if store.test_lock.locked():
             raise HTTPException(409, "已有测试正在进行")
-        if converter.CONFIG.get("cred") is None:
+        with store.lock:
+            credential = converter.CONFIG.get("cred")
+        if credential is None:
             raise HTTPException(400, "请先导入并启用一个账号")
+        with model_catalog_manager.use_credential(credential):
+            models = await asyncio.to_thread(converter.get_available_models)
+        if model not in models:
+            raise HTTPException(400, "请选择列表中的模型")
+        if converter.CONFIG.get("cred") is not credential:
+            raise HTTPException(409, "测试账号已切换，请重新选择模型")
+        if store.test_lock.locked():
+            raise HTTPException(409, "已有测试正在进行")
         async with store.test_lock:
             started = time.monotonic()
             # Use a short-lived API key with the same authentication path as clients.
             with store.lock:
                 temp_key = secrets.token_urlsafe(48)
                 store.test_keys.add(digest(temp_key))
+            credential_token = REQUEST_CREDENTIAL.set(credential)
             try:
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test")), base_url="http://internal") as client:
                     result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "stream": False}), timeout=90)
@@ -542,6 +588,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
             except (Exception, asyncio.TimeoutError):
                 output = {"ok": False, "error": "调用失败或超时，请检查凭据是否有效，稍后重试。", "seconds": round(time.monotonic() - started, 2)}
             finally:
+                REQUEST_CREDENTIAL.reset(credential_token)
                 with store.lock:
                     store.test_keys.discard(digest(temp_key))
             store.events.appendleft({"time": int(time.time()), "model": model, "ok": output["ok"], "seconds": output["seconds"]})

@@ -64,6 +64,7 @@ from .responses_adapter import (
 )
 from .responses_projection import project_responses_chat_body
 from .system_identity import filter_system_identity
+from .model_catalog import model_catalog_manager
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -386,11 +387,18 @@ def _load_models_from_workbuddy() -> list[str]:
         return []
 
 
+def _load_models_from_remote() -> list[str]:
+    """从共享远端模型管理器读取列表，不可用时返回空列表。"""
+    # cred 是当前账号的 CredentialManager；请求已绑定账号时优先使用绑定值。
+    return model_catalog_manager.get_model_ids(CONFIG.get("cred"))
+
+
 def get_available_models() -> list[str]:
     """
     获取可用的模型列表。
 
-    优先从 WorkBuddy product.json 读取，如果失败则使用 DEFAULT_MODELS。
+    优先读取本机 WorkBuddy product.json，其次读取远端配置（缓存 1 小时），
+    都不可用时使用 DEFAULT_MODELS。默认使用当前手动 / 测试凭据。
 
     Returns:
         模型 ID 列表
@@ -401,8 +409,8 @@ def get_available_models() -> list[str]:
         # 成功从 WorkBuddy 加载，使用动态列表
         return workbuddy_models
     else:
-        # 降级到硬编码列表
-        return DEFAULT_MODELS
+        # 远端配置不可用时继续降级到硬编码列表。
+        return _load_models_from_remote() or DEFAULT_MODELS
 
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）

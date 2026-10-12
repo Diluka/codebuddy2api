@@ -10,3 +10,4 @@ wheels
 *.log
 *.env
 preview_admin.py
+deploy/local-dev/

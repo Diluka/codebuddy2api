@@ -333,6 +333,7 @@ uv run python -m core.converter --desensitize --log converter.log
 - 浏览器授权添加国内 CodeBuddy / WorkBuddy 账号，无需桌面端；多账号自动轮转、冷却与积分耗尽避让
 - 凭据刷新、积分余额查询、每日自动签到（默认北京时间 09:00，可配置）
 - 客户端 API Key 创建与撤销、真实模型连接测试
+- 模型页：通过“手动 / 测试”账号读取远端配置，按免费账号范围查看模型倍率与限时优惠，过滤付费专用线路
 - 概览页：请求量、完成成功率、HTTP 成功率、平均耗时与最近 100 条请求
 
 本地启动（需先安装依赖并设置至少 20 位的管理密钥）：
@@ -410,6 +411,7 @@ docker run -d --name workbuddy2api -p 8787:8787 \
 workbuddy2api/
 ├── core/                      # 协议转换核心
 │   ├── converter.py           # 主入口，FastAPI 服务（python3 -m core.converter）
+│   ├── model_catalog.py       # 共享远端模型目录、倍率、优惠和缓存
 │   ├── responses_adapter.py   # OpenAI Responses ↔ Chat 适配
 │   ├── responses_projection.py# Codex / agent 请求投影压缩
 │   ├── anthropic_adapter.py   # Anthropic Messages ↔ Chat 适配

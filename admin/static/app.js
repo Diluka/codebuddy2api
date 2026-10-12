@@ -2,9 +2,12 @@
 const $ = id => document.getElementById(id);
 let csrf = "", overview = null, pendingConfirm = null, page = "dashboard", busy = false;
 let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0;
+let workspaceGeneration = 0, overviewGeneration = 0;
+let modelCatalog = null, modelAccountId = null, modelLoading = false, modelError = "", modelGeneration = 0;
 const labels = {
   dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
+  models: ["模型", "MODEL DIRECTORY", "读取手动 / 测试账号的远端配置，查看免费账号模型的倍率与优惠。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
   guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
@@ -13,6 +16,8 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
 const stamp = ts => ts ? new Date(ts).toLocaleString("zh-CN", {hour12:false}) : "未提供";
 function toast(message) { $("toast").textContent = message; $("toast").hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $("toast").hidden = true, 4500); }
 function showLogin() {
+  workspaceGeneration++;
+  clearModelCatalog();
   csrf = ""; overview = null; $("workspace").hidden = true; $("login").hidden = false; $("boot").hidden = true;
   document.querySelectorAll("dialog[open]").forEach(d => d.close()); $("admin-key").value = "";
 }
@@ -37,6 +42,14 @@ function goPage(next) {
   const dot = document.createElement("span"); dot.className = "title-dot"; dot.textContent = "."; $("page-title").append(dot);
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
+  $("refresh").innerHTML = next === "models" ? "<span>↻</span> 刷新模型" : "<span>↻</span> 刷新状态";
+  if (next === "models") {
+    syncModelAccount();
+    renderModelCatalog();
+    loadModelCatalog();
+  } else {
+    $("refresh").disabled = false;
+  }
 }
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
@@ -63,6 +76,9 @@ function render() {
   if (models.includes(selected)) $("model").value = selected;
   $("test-submit").disabled = !active || busy;
   $("test-history").innerHTML = events.length ? events.map(e => `<div class="history-row"><span class="mono muted">${esc(stamp(e.time * 1000))}</span><strong>${esc(e.model)}</strong><span class="pill ${e.ok ? "green" : "red"}">${e.ok ? "成功" : "失败"}</span><span class="mono">${e.seconds}s</span></div>`).join("") : '<p class="history-empty">暂无测试记录，发送第一条测试消息。</p>';
+  const modelAccountChanged = syncModelAccount();
+  renderModelCatalog();
+  if (page === "models" && modelAccountChanged) loadModelCatalog();
 }
 function renderDashboard() {
   const {accounts, metrics:m = {}, pool} = overview;
@@ -101,11 +117,223 @@ function renderAccounts() {
 }
 $("account-search").addEventListener("input", () => { if(overview) renderAccounts(); });
 $("account-filter").addEventListener("change", () => { if(overview) renderAccounts(); });
+
+function selectedModelAccount() {
+  return overview?.accounts.find(account => account.active && account.enabled) || null;
+}
+
+function clearModelCatalog(accountId = null) {
+  modelGeneration++;
+  modelAccountId = accountId;
+  modelCatalog = null;
+  modelLoading = false;
+  modelError = "";
+  $("models-body").replaceChildren();
+}
+
+function syncModelAccount() {
+  const accountId = selectedModelAccount()?.id || null;
+  if (accountId === modelAccountId) return false;
+  clearModelCatalog(accountId);
+  return true;
+}
+
+function creditNumber(value) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim().replace(/^[x×]\s*/i, "").replace(/\s*[x×]$/i, "");
+  if (!/^\d+(?:\.\d+)?$/.test(normalized)) return null;
+  const result = Number(normalized);
+  return Number.isFinite(result) ? result : null;
+}
+
+function creditLabel(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return "未标注";
+  if (creditNumber(value) === null) return String(value).trim();
+  return "x" + String(value).trim().replace(/^[x×]\s*/i, "").replace(/\s*[x×]$/i, "");
+}
+
+function hasFreePromotion(model) {
+  return model.promotion?.active === true && creditNumber(model.promotion.discounted_credits) === 0;
+}
+
+function modelReasoningEfforts(model) {
+  return Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts.filter(effort => typeof effort === "string" && effort) : [];
+}
+
+function modelPiConfig(model) {
+  // JSON-quoted strings are valid YAML and keep values such as "off" as strings.
+  const quoted = value => JSON.stringify(String(value));
+  const credits = model.effective_credits || model.credits;
+  const rate = creditNumber(credits) === null ? credits : creditLabel(credits).slice(1) + "x";
+  const promotion = model.promotion?.active ? model.promotion.label || (hasFreePromotion(model) ? "当前限免" : "") : "";
+  const suffix = [rate, promotion].filter(Boolean).join(" ");
+  const name = (model.name || model.id) + (suffix ? ` (${suffix})` : "");
+  const lines = [`- id: ${quoted(model.id)}`, `  name: ${quoted(name)}`];
+  for (const [field, value] of [["contextWindow", model.max_input_tokens], ["maxTokens", model.max_output_tokens]]) {
+    if (Number.isFinite(value) && value >= 0) lines.push(`  ${field}: ${value}`);
+  }
+  lines.push("  input:", "    - text");
+  if (model.supports_images) lines.push("    - image");
+  const efforts = modelReasoningEfforts(model);
+  if (efforts.length) {
+    lines.push("  reasoningEfforts:");
+    for (const effort of efforts) lines.push(`    ${quoted(effort)}: ${quoted(effort)}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+function renderModelCapabilities(model) {
+  const limits = [["最大输入 tokens", model.max_input_tokens], ["最大输出 tokens", model.max_output_tokens]];
+  const details = limits.filter(([, value]) => Number.isFinite(value) && value >= 0)
+    .map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value.toLocaleString("en-US", {maximumFractionDigits: 20}))}</dd></div>`);
+  const efforts = modelReasoningEfforts(model);
+  if (efforts.length) {
+    const values = efforts.map(esc).join(", ");
+    details.push(`<div><dt>思考强度</dt><dd>${values}</dd></div>`);
+  }
+  return details.length ? `<dl class="model-capability-details">${details.join("")}</dl>` : "";
+}
+
+function renderModelRow(model) {
+  const promotion = model.promotion;
+  const capabilities = [model.supports_images ? "支持图片" : "", model.supports_reasoning ? "支持推理" : ""].filter(Boolean);
+  const routeLabel = model.is_dynamic_route === true ? '<span class="pill" title="根据路由策略动态选择实际模型">动态模型路由</span>' : "";
+  let promotionHtml = '<span class="muted">暂无优惠配置</span>';
+  if (promotion) {
+    const label = promotion.label || (hasFreePromotion(model) ? "当前限免" : "优惠活动");
+    promotionHtml = `<span class="pill ${promotion.active ? "green" : ""}">${esc(label)}</span>${promotion.active ? "" : '<span class="model-promotion-state">未生效</span>'}`;
+    if (promotion.description) promotionHtml += `<small class="model-promotion-description">${esc(promotion.description)}</small>`;
+    if (promotion.schedule_text) promotionHtml += `<small class="model-promotion-schedule">${esc(promotion.schedule_text)}</small>`;
+  }
+  return `<tr>
+    <td data-label="模型 / ID"><div class="model-identity"><div class="model-name-row"><strong>${esc(model.name || model.id)}</strong>${routeLabel}</div>${model.description ? `<small class="model-description">${esc(model.description)}</small>` : ""}<div class="model-id-row"><code>${esc(model.id)}</code><button class="copy-button" data-model-copy="${esc(model.id)}" aria-label="复制模型 ID ${esc(model.id)}">复制</button><button class="copy-button" data-model-config-copy="${esc(model.id)}" aria-label="复制配置 ${esc(model.id)}">复制配置</button></div>${capabilities.length ? `<small class="model-capabilities">${capabilities.join(" · ")}</small>` : ""}${renderModelCapabilities(model)}</div></td>
+    <td data-label="消费倍率"><div class="model-rate"><strong>${esc(creditLabel(model.effective_credits))}</strong><small>原始 ${esc(creditLabel(model.credits))}</small></div></td>
+    <td data-label="优惠"><div class="model-promotion">${promotionHtml}</div></td>
+  </tr>`;
+}
+
+function renderModelCatalog() {
+  const account = selectedModelAccount();
+  const catalog = account && modelAccountId === account.id ? modelCatalog : null;
+  $("models-account").textContent = account?.name || "未选择账号";
+  $("models-updated").textContent = catalog?.fetched_at ? "上次同步 " + stamp(catalog.fetched_at * 1000) : "尚未同步远端配置";
+  $("models-content").setAttribute("aria-busy", String(modelLoading));
+  $("models-search").disabled = $("models-filter").disabled = !catalog;
+  if (page === "models") $("refresh").disabled = !account || modelLoading;
+
+  const warning = modelError || catalog?.error || (catalog?.stale ? "当前为上次成功获取的配置，请刷新后确认最新优惠。" : "");
+  $("models-error").hidden = !warning;
+  $("models-error").textContent = warning ? (catalog ? "刷新未完成，保留上次配置。" : "") + warning : "";
+  const status = modelLoading ? [catalog ? "正在更新" : "正在同步", "amber"] : warning ? [catalog ? "缓存待刷新" : "查询失败", "amber"] : catalog ? ["已同步", "green"] : ["等待查询", ""];
+  $("models-sync-state").textContent = status[0];
+  $("models-sync-state").className = "pill " + status[1];
+
+  const models = catalog?.models || [];
+  const query = $("models-search").value.trim().toLowerCase();
+  const filter = $("models-filter").value;
+  const rows = models.filter(model => {
+    const matchesQuery = !query || [model.name, model.id].join(" ").toLowerCase().includes(query);
+    const matchesFilter = filter === "all" || (filter === "offers" ? Boolean(model.promotion) : hasFreePromotion(model));
+    return matchesQuery && matchesFilter;
+  });
+  $("models-count").textContent = String(models.length);
+  $("models-catalog-note").textContent = catalog ? `显示 ${rows.length} / ${models.length} 个模型` : "";
+  $("models-table").hidden = !rows.length;
+  $("models-body").innerHTML = rows.map(renderModelRow).join("");
+  $("models-empty").hidden = rows.length > 0;
+  $("models-empty-action").hidden = false;
+  if (!account) {
+    $("models-empty-title").textContent = "先选择查询账号";
+    $("models-empty-description").textContent = "在账号池中选择一个已启用的“手动 / 测试”账号，即可读取模型配置。";
+    $("models-empty-action").textContent = "前往账号池";
+  } else if (modelLoading && !catalog) {
+    $("models-empty-title").textContent = "正在读取模型配置";
+    $("models-empty-description").textContent = "正在获取当前账号的模型、倍率与优惠信息…";
+    $("models-empty-action").hidden = true;
+  } else if (!catalog) {
+    $("models-empty-title").textContent = modelError ? "暂时无法获取模型" : "尚未获取模型配置";
+    $("models-empty-description").textContent = "可重试查询，或前往账号池检查当前账号状态。";
+    $("models-empty-action").textContent = "重试查询";
+  } else if (!models.length) {
+    $("models-empty-title").textContent = "当前配置没有可展示的模型";
+    $("models-empty-description").textContent = "上游未返回符合免费账号范围且标注费率的模型，可以稍后刷新。";
+    $("models-empty-action").textContent = "刷新模型";
+  } else {
+    $("models-empty-title").textContent = "没有符合条件的模型";
+    $("models-empty-description").textContent = "试试其他名称或 ID，或者清除筛选条件。";
+    $("models-empty-action").textContent = "清除筛选";
+  }
+}
+
+async function loadModelCatalog(force = false) {
+  syncModelAccount();
+  const account = selectedModelAccount();
+  if (!csrf || !account || page !== "models" || modelLoading) return;
+  const generation = ++modelGeneration;
+  const accountId = account.id;
+  modelLoading = true;
+  modelError = "";
+  renderModelCatalog();
+  try {
+    const result = await api(force ? "models/refresh" : "models", force ? {method:"POST"} : {});
+    if (generation !== modelGeneration || selectedModelAccount()?.id !== accountId || !csrf) return;
+    if (result.account?.id !== accountId) {
+      modelCatalog = null;
+      modelError = "查询账号已变更，请稍后刷新。";
+      await refresh();
+      return;
+    }
+    modelCatalog = result;
+  } catch (error) {
+    if (generation !== modelGeneration || selectedModelAccount()?.id !== accountId || !csrf) return;
+    modelError = error.message;
+  } finally {
+    if (generation === modelGeneration) {
+      modelLoading = false;
+      renderModelCatalog();
+    }
+  }
+}
+
+$("models-choose-account").addEventListener("click", () => goPage("accounts"));
+$("models-search").addEventListener("input", renderModelCatalog);
+$("models-filter").addEventListener("change", renderModelCatalog);
+$("models-empty-action").addEventListener("click", () => {
+  if (!selectedModelAccount()) return goPage("accounts");
+  if (modelCatalog?.models.length) {
+    $("models-search").value = "";
+    $("models-filter").value = "all";
+    renderModelCatalog();
+  } else {
+    loadModelCatalog(true);
+  }
+});
+$("models-body").addEventListener("click", event => {
+  const button = event.target.closest("[data-model-copy]");
+  if (button) return copy(button.dataset.modelCopy);
+  const configButton = event.target.closest("[data-model-config-copy]");
+  const model = configButton && modelCatalog?.models.find(model => model.id === configButton.dataset.modelConfigCopy);
+  if (model) copy(modelPiConfig(model));
+});
+
 async function refresh() {
+  const generation = workspaceGeneration;
+  const requestGeneration = ++overviewGeneration;
   $("refresh").disabled = true;
-  try { overview = await api("overview"); render(); $("load-error").hidden = true; }
-  catch (e) { $("load-error").textContent = e.message; $("load-error").hidden = false; throw e; }
-  finally { $("refresh").disabled = false; }
+  try {
+    const result = await api("overview");
+    if (generation !== workspaceGeneration || requestGeneration !== overviewGeneration || !csrf) return;
+    overview = result;
+    render();
+    $("load-error").hidden = true;
+  }
+  catch (e) {
+    if (generation !== workspaceGeneration || requestGeneration !== overviewGeneration || !csrf) return;
+    $("load-error").textContent = e.message;
+    $("load-error").hidden = false;
+    throw e;
+  }
+  finally { $("refresh").disabled = page === "models" ? !selectedModelAccount() || modelLoading : false; }
 }
 async function enter() { $("boot").hidden = true; $("login").hidden = true; $("workspace").hidden = false; goPage(location.hash.slice(1)); await refresh(); }
 $("login-form").addEventListener("submit", async e => {
@@ -114,7 +342,12 @@ $("login-form").addEventListener("submit", async e => {
   catch (error) { $("login-error").textContent = error.message; }
   finally { button.disabled = false; }
 });
-$("logout").addEventListener("click", async () => { try { await api("logout", {method:"POST"}); showLogin(); } catch (e) { toast(e.message); } });
+$("logout").addEventListener("click", async () => {
+  const request = api("logout", {method:"POST"});
+  showLogin();
+  renderModelCatalog();
+  try { await request; } catch (e) { toast(e.message); }
+});
 async function batchAction(action) {
   $("refresh").disabled = $("batch-checkin").disabled = true;
   try {
@@ -124,10 +357,21 @@ async function batchAction(action) {
     await refresh();
   } catch(e) { toast(e.message); } finally { $("refresh").disabled = $("batch-checkin").disabled = false; }
 }
-$("refresh").addEventListener("click", () => page === "accounts" ? batchAction("status") : refresh().catch(e=>toast(e.message)));
+$("refresh").addEventListener("click", () => {
+  if (page === "models") return loadModelCatalog(true);
+  if (page === "accounts") return batchAction("status");
+  refresh().catch(e => toast(e.message));
+});
 $("batch-checkin").addEventListener("click", () => batchAction("checkin"));
 $("pool-settings").addEventListener("submit", async e => { e.preventDefault();e.submitter.disabled=true;try {await api("pool/settings",{method:"PATCH",body:{routing:$("pool-routing").value,auto_checkin:$("auto-checkin").checked,checkin_time:$("checkin-time").value}});await refresh();toast("账号池设置已保存");}catch(err){toast(err.message);}finally{e.submitter.disabled=false;} });
-setInterval(() => { if(csrf && overview && !document.hidden && !document.querySelector("dialog[open]") && !$("refresh").disabled) refresh().catch(()=>{}); },30000);
+setInterval(async () => {
+  if (!csrf || !overview || document.hidden || document.querySelector("dialog[open]")) return;
+  if (page !== "models" && $("refresh").disabled) return;
+  try {
+    await refresh();
+    if (page === "models") await loadModelCatalog();
+  } catch {}
+}, 30000);
 document.querySelectorAll("[data-page]").forEach(b => b.addEventListener("click", () => goPage(b.dataset.page)));
 $("go-guide").addEventListener("click", () => goPage("guide"));
 document.querySelectorAll(".close-dialog").forEach(b => b.addEventListener("click", () => b.closest("dialog").close()));
@@ -224,11 +468,20 @@ $("accounts-body").addEventListener("click", async e => {
     try { const result=await api(`accounts/${a.id}/actions/${b.dataset.action}`,{method:"POST"});toast(result.message);await refresh(); }
     catch(err){toast(err.message);} finally {b.disabled=false;} return;
   }
-  const update = body => api("accounts/" + a.id, {method:"PATCH", body});
+  const update = async body => {
+    const result = await api("accounts/" + a.id, {method:"PATCH", body});
+    overviewGeneration++;
+    if (body.active || (a.active && body.enabled !== undefined)) clearModelCatalog();
+    return result;
+  };
   if (b.dataset.action === "activate") confirmAction("设置手动 / 测试账号？", `设为「${a.name}」。仅在手动调度模式和连接测试中使用；账号池轮转模式仍自动分配。`, () => update({active:true}));
   if (b.dataset.action === "rename") confirmAction("编辑账号备注", "备注仅用于在管理后台识别账号。", () => update({name:$("rename-value").value}), a.name);
   if (b.dataset.action === "toggle") confirmAction(a.enabled ? "暂停这个账号？" : "恢复这个账号？", "暂停后不参与新请求分配和自动签到，已开始的请求继续完成。恢复后重新参与轮转。", () => update({enabled:!a.enabled}));
-  if (b.dataset.action === "delete") confirmAction("删除这个账号？", `「${a.name}」将从账号列表移除。服务器保留恢复副本。${a.active ? "当前调用账号将被清空。" : ""}`, () => api("accounts/" + a.id, {method:"DELETE"}));
+  if (b.dataset.action === "delete") confirmAction("删除这个账号？", `「${a.name}」将从账号列表移除。服务器保留恢复副本。${a.active ? "当前调用账号将被清空。" : ""}`, async () => {
+    await api("accounts/" + a.id, {method:"DELETE"});
+    overviewGeneration++;
+    if (a.active) clearModelCatalog();
+  });
 });
 $("keys-body").addEventListener("click", e => { const b = e.target.closest("[data-revoke]"); if (!b) return; const k = overview.keys.find(x => x.id === b.dataset.revoke); confirmAction("撤销客户端密钥？", `使用「${k.name}」的客户端将无法发起新请求。此操作不可撤销。`, () => api("keys/" + k.id, {method:"DELETE"})); });
 $("add-key").addEventListener("click", () => { $("key-form").hidden = false; $("created-key").hidden = true; $("key-dialog").showModal(); });

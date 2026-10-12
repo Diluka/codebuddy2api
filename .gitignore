@@ -29,6 +29,7 @@ auth/
 management/
 backups/
 deploy/one-click/data/
+deploy/local-dev/
 wheels/
 *.info
 *.tar.gz

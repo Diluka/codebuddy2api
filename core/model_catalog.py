@@ -1,28 +1,21 @@
 """Shared read-only WorkBuddy model configuration, scoped to a credential manager."""
-import hashlib
 import math
 import re
-import threading
 import time
-from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from weakref import WeakKeyDictionary
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import HTTPException
 
+from .credentials import CredentialManager, REFRESH_ERRORS
+from .model_routes import LEGACY_AUTO_ROUTE_IDS
+from .memory_cache import CacheInvalidated, MemoryCache
+
 CONFIG_URL = "https://www.workbuddy.cn/v3/config"
-USER_AGENT = "WorkBuddy/5.7.7 WorkBuddy/5.7.7 CLI/2.156.0"
 CACHE_TTL = 3600
-DOMAINS = {"workbuddy.cn", "www.workbuddy.cn", "codebuddy.cn", "www.codebuddy.cn"}
 FETCH_ERROR = "模型配置查询失败，请检查登录状态或网络后重试"
-# /v3/config supplies model metadata but no auto-to-route mapping or route flag.
-# This compatibility mapping follows the App's AUTO_TIER_MODEL_IDS; it never
-# supplies missing model entries, rates or capabilities.
-LEGACY_AUTO_ROUTE_IDS = ("fast-model", "balanced-model", "deep-model")
 
 
 def _mapping(value):
@@ -197,6 +190,10 @@ def _expand_auto_ids(model_ids):
     return expanded
 
 
+def _is_custom(model):
+    return "custom" in _array(model.get("tags")) or model["id"].startswith(("custom:", "custom-local:"))
+
+
 def _selected_models(config):
     """Select the App's agent catalog and expand legacy auto into current routes."""
     models = [m for m in _array(config.get("models")) if isinstance(m, dict) and _text(m.get("id"))]
@@ -228,7 +225,7 @@ def _selected_models(config):
         # Missing route metadata must not broaden an auto-only agent to all chat models.
         restricted = bool(allowed) or "auto" in _array(agent.get("models"))
         for model in models:
-            custom = "custom" in _array(model.get("tags")) or model["id"].startswith(("custom:", "custom-local:"))
+            custom = _is_custom(model)
             if restricted and model["id"] not in allowed and not custom:
                 continue
             if custom or "chat" in _array(model.get("tags")):
@@ -276,6 +273,7 @@ def evaluate_models(config, now):
             efforts.insert(0, "off")
         result.append({"id": model["id"], "name": _text(model.get("name")) or model["id"],
                        "is_dynamic_route": model["id"] in LEGACY_AUTO_ROUTE_IDS,
+                       "is_custom": _is_custom(model),
                        "description": _text(model.get("descriptionZh")) or _text(model.get("description")),
                        "credits": credits, "effective_credits": (promotion or {}).get("discounted_credits") or credits,
                        "line_type": types.get(model["id"], "unmarked"), "promotion": promotion,
@@ -288,131 +286,59 @@ def evaluate_models(config, now):
 
 
 class ModelCatalogManager:
-    """Shared catalog access with isolated account caches and request credentials."""
+    """Model configuration and lists, independent of live busy status."""
 
-    def __init__(self, clock=time.time, client_factory=None):
-        self.clock, self.client_factory = clock, client_factory
-        self._catalogs = WeakKeyDictionary()
-        self._lock = threading.Lock()
-        self._credential = ContextVar("model_catalog_credential", default=())
+    def __init__(self, clock=time.monotonic, client_factory=None, *, wall_clock=time.time):
+        self.wall_clock = wall_clock
+        self.client_factory = client_factory or (lambda: httpx.Client(timeout=15, follow_redirects=False))
+        self.cache = MemoryCache(CACHE_TTL, clock=clock, wall_clock=wall_clock,
+                                 stale_if_error=True, errors=REFRESH_ERRORS)
 
-    @contextmanager
-    def use_credential(self, credential):
-        """Pin an account snapshot, including an explicitly missing account."""
-        token = self._credential.set((credential,))
-        try:
-            yield
-        finally:
-            self._credential.reset(token)
+    def _fetch(self, key, headers):
+        with self.client_factory() as client:
+            response = client.get(CONFIG_URL, headers=headers, follow_redirects=False)
+        if response.status_code != 200:
+            raise ValueError("config unavailable")
+        data = response.json()
+        if not isinstance(data, dict) or data.get("code", 0) != 0 or not isinstance(data.get("data"), dict):
+            raise ValueError("invalid config envelope")
+        config = data["data"]
+        if not isinstance(config.get("models"), list):
+            raise ValueError("missing model catalog")
+        # Retain only fields needed by the catalog, never the full product config.
+        return {k: config.get(k) for k in
+                ("models", "agents", "availableModels", "modelPromotions", "productFeaturesConfig")}
 
-    def get(self, credential, force=False):
-        """Return account metadata, preserving refresh errors for the admin UI."""
+    def get(self, force=False):
+        """Return evaluated metadata; failed refreshes keep old display values."""
+        credential = CredentialManager.current()
         if credential is None:
             raise HTTPException(400, "请先选定模型查询账号")
-        with self._lock:
-            catalog = self._catalogs.get(credential)
-            if catalog is None:
-                catalog = _AccountModelCatalog(clock=self.clock, client_factory=self.client_factory)
-                self._catalogs[credential] = catalog
-        return catalog.get(credential, force=force)
-
-    def get_model_ids(self, default_credential=None):
-        """Return usable IDs, or an empty list when remote data is unavailable."""
-        bound = self._credential.get()
-        credential = bound[0] if bound else default_credential
-        if credential is None:
-            return []
         try:
-            result = self.get(credential)
+            entry = self.cache.get("config", self._fetch, scope=credential,
+                                   revision=credential.fingerprint, prepare=credential.request_snapshot,
+                                   force=force)
+        except CacheInvalidated:
+            raise HTTPException(400, "登录凭据已变更，请重新加载模型信息") from None
+        except REFRESH_ERRORS:
+            raise HTTPException(502, FETCH_ERROR) from None
+        if not entry.found:
+            raise HTTPException(502, FETCH_ERROR)
+        now = self.wall_clock()
+        models = evaluate_models(entry.value, now)
+        return {"models": models, "fetched_at": entry.updated_at, "evaluated_at": now,
+                "stale": entry.stale, "error": FETCH_ERROR if entry.stale else None,
+                "total_models": len(_array(entry.value.get("models"))), "filtered_models": len(models)}
+
+    def get_model_ids(self):
+        """Return usable IDs, or an empty list when remote data is unavailable."""
+        try:
+            result = self.get()
             if result["stale"] or result["error"]:
                 return []
             return [model["id"] for model in result["models"]]
         except (HTTPException, httpx.HTTPError, OSError, ValueError, RuntimeError):
             return []
-
-
-class _AccountModelCatalog:
-    def __init__(self, clock=time.time, client_factory=None):
-        self.clock = clock
-        self.client_factory = client_factory or (lambda: httpx.Client(timeout=15, follow_redirects=False))
-        self.lock = threading.Lock()
-        self.cache = None
-
-    @staticmethod
-    def _fingerprint(manager):
-        with manager._lock:
-            return hashlib.sha256(manager.path.read_bytes()).hexdigest()
-
-    def _request_headers(self, manager):
-        # get_headers owns a non-reentrant lock, so bracket it with snapshots.
-        # Its normal token refresh changes the file; repeat once for that case.
-        for _ in range(2):
-            before = self._fingerprint(manager)
-            headers = httpx.Headers(manager.get_headers())
-            after = self._fingerprint(manager)
-            if before == after:
-                return headers, after
-        raise HTTPException(400, "登录凭据正在变更，请稍后重新加载模型信息")
-
-    def get(self, manager, force=False):
-        with self.lock:
-            fingerprint = None
-            error = None
-            try:
-                fingerprint = self._fingerprint(manager)
-                previous = self.cache
-                if previous and previous["fingerprint"] != fingerprint:
-                    self.cache = None
-                entry = self.cache
-                if force or not entry or self.clock() - entry["fetched_at"] >= CACHE_TTL:
-                    # get_headers owns the manager lock and may refresh credentials.
-                    # No manager lock spans the configuration HTTP request.
-                    headers, fingerprint = self._request_headers(manager)
-                    if headers.get("X-Domain", "").lower().strip() not in DOMAINS:
-                        raise HTTPException(400, "模型信息查询目前仅支持国内 WorkBuddy / CodeBuddy 账号")
-                    entry = self.cache
-                    if entry and entry["fingerprint"] != fingerprint:
-                        self.cache = None
-                    headers.update({"User-Agent": USER_AGENT, "X-Product": "SaaS", "X-Requested-With": "XMLHttpRequest"})
-                    with self.client_factory() as client:
-                        response = client.get(CONFIG_URL, headers=headers, follow_redirects=False)
-                    if response.status_code != 200:
-                        raise ValueError("config unavailable")
-                    data = response.json()
-                    if not isinstance(data, dict) or data.get("code", 0) != 0 or not isinstance(data.get("data"), dict):
-                        raise ValueError("invalid config envelope")
-                    config = data["data"]
-                    if not isinstance(config.get("models"), list):
-                        raise ValueError("missing model catalog")
-                    if fingerprint != self._fingerprint(manager):
-                        raise HTTPException(400, "登录凭据已变更，请重新加载模型信息")
-                    # Cache only fields used by this feature, never the full product config.
-                    config = {k: config.get(k) for k in ("models", "agents", "availableModels", "modelPromotions", "productFeaturesConfig")}
-                    self.cache = {"fingerprint": fingerprint, "config": config, "fetched_at": self.clock()}
-            except HTTPException:
-                raise
-            except (httpx.HTTPError, OSError, ValueError, RuntimeError, KeyError, TypeError):
-                error = FETCH_ERROR
-            # A concurrent credential replacement must not revive the old cache,
-            # including when a refresh failed before producing request headers.
-            try:
-                fingerprint = self._fingerprint(manager)
-            except OSError:
-                fingerprint = None
-            entry = self.cache
-            if not entry or fingerprint is None or entry["fingerprint"] != fingerprint:
-                raise HTTPException(502, error or FETCH_ERROR)
-            now = self.clock()
-            config = entry["config"]
-            models = evaluate_models(config, now)
-            # Keep failed refresh visible until a later successful fetch.
-            if error:
-                entry["error"] = error
-            return {"models": models,
-                    "fetched_at": entry["fetched_at"], "evaluated_at": now,
-                    "stale": bool(entry.get("error")) or now - entry["fetched_at"] >= CACHE_TTL,
-                    "error": entry.get("error"), "total_models": len(_array(config.get("models"))),
-                    "filtered_models": len(models)}
 
 
 model_catalog_manager = ModelCatalogManager()

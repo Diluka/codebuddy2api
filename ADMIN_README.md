@@ -23,7 +23,10 @@
 - `admin/browser_login.py`：WorkBuddy 授权状态创建、独立 cookie 会话、轮询和令牌交换。授权会话绑定管理登录，令牌不返回浏览器；超时、取消、登出后清理。
 - `admin/pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到。`tests/test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
 - `admin/metrics.py`：本次进程启动以来的有界请求统计；不存储请求正文、回复或密钥。
-- `core/model_catalog.py`：进程内共享的远端模型单例管理器，封装按凭据缓存、目录筛选、优惠计算及模型 ID 列表降级。转换器与管理接口均显式传入账号凭据管理器；`admin/server.py` 负责选取并复核“手动 / 测试”账号。`tests/test_model_catalog.py` 覆盖目录筛选、优惠规则和缓存隔离。
+- `core/model_catalog.py`：进程内共享的远端模型单例管理器，封装按凭据缓存、目录筛选、优惠计算及模型 ID 列表降级。查询开始时通过 `CredentialManager.current()` 获取并固定“手动 / 测试”账号，无需调用者传入凭据。`tests/test_model_catalog.py` 覆盖目录筛选、优惠规则和缓存隔离。
+- `core/model_busy.py`：独立的繁忙程度管理器，按账号与模型逐条缓存；管理接口将结果合入模型列表。
+- `core/credentials.py`：独立的凭据管理模块，负责读取、令牌刷新、加密回写、版本指纹与稳定请求头快照，统一维护当前凭据的运行时引用。账号管理层通过 `set_current()` 主动设置已有实例或 `None`，调用方通过 `current()` 读取；模块不依赖管理后台或转换器。凭据数据使用不按时间过期、按文件内容版本失效的缓存。
+- `core/memory_cache.py`：三个管理器共用的内存缓存实现，各持独立实例。只负责键值、TTL、版本失效、批量补查、并发合并、失败回退及主动更新；不依赖业务模块。两个模型管理器共同依赖凭据模块，不相互依赖。
 - `admin/static/`：无外部 CDN 依赖的中文界面。
 - `tests/test_admin_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
 - `deploy/admin/Dockerfile`：在已部署的转换器镜像上构建管理层，不修改模型转换逻辑。
@@ -84,7 +87,21 @@ docker compose -f deploy/admin/docker-compose.yml up -d --build
 
 配置按账号在服务端缓存 1 小时，模型页与 API 模型列表共用同一份缓存，按需读取。页面可见时每 30 秒更新优惠状态，无需重新获取配置。“刷新模型”立即重新查询配置；失败时页面保留该账号最近一次成功结果并标记待刷新，API 模型列表继续降级。切换账号、停用账号或更换凭据后，不会复用其它账号或旧凭据的配置。
 
+“繁忙程度”来自独立的 `POST https://copilot.tencent.com/v2/chat/busy` 接口，通过当前查询账号按模型 ID 查询，每批最多 50 个模型、请求超时 5 秒。状态按“账号＋模型 ID”逐条缓存 50 秒，只补查缺失或过期的条目；模型列表增减不影响其它条目的有效期。复用模型页每 30 秒的可见页面轮询，通常约 60 秒获取一次新状态；“刷新模型”同时强制刷新当前列表的繁忙程度。动态模型路由和自定义模型在请求前排除，显示 `—`。配置、繁忙程度与凭据共用 `MemoryCache` 实现，但各自使用独立实例，不新增后台定时查询。
+
+繁忙程度沿用 App 文案：`idle` / `normal` 为“空闲”，`busy` 为“轻微拥堵”，`congested` 为“极度拥堵”，`unavailable` 为“不可用”；未知或尚无数据时显示 `—`。刷新失败或上游返回 `unknown` 时保留该模型最近一次有效状态并标注“待刷新”，鼠标悬停可查看上次成功更新时间；50 秒后允许按需重试。凭据变更立即失效旧缓存。失败只影响这一列，不触发 `/v1/models` 降级，也不因繁忙或不可用而隐藏模型、阻止请求或改变复制配置。
+
 页面的搜索与限免筛选只影响展示，不限制客户端调用或更改请求轮转。查询复用现有凭据管理器，令牌到期时遵循原有自动刷新逻辑。
+
+两个模型管理器均为进程单例，各自在一次查询中固定使用开始时选定的凭据实例；缓存仍按账号隔离。管理接口组合两者结果时复核账号记录及凭据版本，查询期间切换账号（包括切走后切回）会拒绝返回结果。后台通过 `Store.sync_active()` 在加载账号配置或选定账号变化时更新当前引用，复用已有实例及缓存；账号配置仍由后台持久化。独立转换器启动加载凭据后调用 `set_current()`，`CONFIG` 不再保存凭据引用，保持原有启动方式。
+
+```python
+CredentialManager.set_current(existing_credential)  # 账号管理层设置已有实例，或 None
+credential = CredentialManager.current()  # 当前已有实例，或 None
+catalog = model_catalog_manager.get(force=False)
+model_ids = model_catalog_manager.get_model_ids()
+models = model_busy_manager.get(catalog["models"], force=False)
+```
 
 管理接口均需要管理员会话：
 
@@ -95,6 +112,24 @@ docker compose -f deploy/admin/docker-compose.yml up -d --build
 
 返回字段包括查询账号、模型列表、同步时间、优惠计算时间及缓存状态；不会返回完整配置或登录凭据。
 
+## 内存缓存接口
+
+`MemoryCache(ttl=None, *, stale_if_error=False, retry_ttl=0, batch_size=None, errors=(Exception,), clock=time.monotonic, wall_clock=time.time)` 支持普通可哈希键与命名空间。TTL 使用单调时钟，成功更新时间使用墙上时间；`ttl=None` 不按时间过期。
+
+| 方法 | 用途 |
+|---|---|
+| `get(key, load, *, scope=None, revision=None, prepare=None, force=False)` | 返回单个 `CacheResult`；内部复用 `get_many` |
+| `get_many(keys, load, *, scope=None, revision=None, prepare=None, force=False)` | 返回键到 `CacheResult` 的映射，只分批加载到期或缺失项 |
+| `set(key, value, *, scope=None, revision=None)` | 主动写入，`revision` 为值对应的版本 |
+| `invalidate(key, *, scope=None)` | 使指定键失效 |
+| `clear(*, scope=None)` | 清理指定命名空间，省略时只清默认命名空间 |
+
+普通读取只需提供键和 `load(key, context)`；批量加载器为 `load(keys, context)`，返回键值映射。可选 `revision()` 提供当前数据版本，`prepare()` 仅在需要加载时执行，返回配对的 `(version, context)`；未提供时 context 为 `None`。准备步骤产生新版本会清理旧版本数据，并重新计算待加载条目。
+
+`CacheResult(found, value, updated_at, stale)` 通过 `found` 区分未取得数据与成功缓存的 `None`、`False`、`0` 或空列表。加载异常默认传播；开启 `stale_if_error` 后，对配置的异常及批量遗漏项返回同版本旧值并标记过期，没有旧值则 `found=False`、`stale=True`。`retry_ttl` 只限制失败后重试频率，不延长成功值的有效期或更新时间。严格模式下批量遗漏项抛出 `KeyError`，同批成功项仍保存。
+
+版本变化、版本无法确认或在途加载期间主动更新/失效，均抛出 `CacheInvalidated`，不会读取旧版本或回写旧结果。主动变更只短暂持有状态锁，不等待网络加载完成；同命名空间的在途加载会被拒绝。
+
 ## 验证
 
 ```bash
@@ -103,7 +138,9 @@ python -m unittest tests.test_browser_login -v
 python -m unittest tests.test_account_pool -v
 python -m unittest tests.test_request_metrics -v
 python -m unittest tests.test_model_catalog -v
+python -m unittest tests.test_model_busy -v
 python -m unittest tests.test_model_sources -v
+python -m pytest tests/test_memory_cache.py tests/test_credentials.py -q
 node --check admin/static/app.js
 ```
 

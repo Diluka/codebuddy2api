@@ -194,6 +194,18 @@ function renderModelCapabilities(model) {
   return details.length ? `<dl class="model-capability-details">${details.join("")}</dl>` : "";
 }
 
+function renderModelBusy(model) {
+  const status = {
+    idle: ["空闲", "green"], normal: ["空闲", "green"],
+    busy: ["轻微拥堵", "amber"], congested: ["极度拥堵", "red"],
+    unavailable: ["不可用", "red"],
+  }[model.busy_level];
+  if (model.is_dynamic_route || !status) return '<span class="muted">—</span>';
+  const updated = Number.isFinite(model.busy_updated_at) ? "上次更新 " + stamp(model.busy_updated_at * 1000) : "";
+  const title = [model.busy_level === "unavailable" ? "当前模型服务异常，暂不可用" : "", updated].filter(Boolean).join("；");
+  return `<span class="pill ${status[1]}" title="${esc(title)}">${status[0]}</span>${model.busy_stale ? '<small class="model-busy-stale">待刷新</small>' : ""}`;
+}
+
 function renderModelRow(model) {
   const promotion = model.promotion;
   const capabilities = [model.supports_images ? "支持图片" : "", model.supports_reasoning ? "支持推理" : ""].filter(Boolean);
@@ -208,6 +220,7 @@ function renderModelRow(model) {
   return `<tr>
     <td data-label="模型 / ID"><div class="model-identity"><div class="model-name-row"><strong>${esc(model.name || model.id)}</strong>${routeLabel}</div>${model.description ? `<small class="model-description">${esc(model.description)}</small>` : ""}<div class="model-id-row"><code>${esc(model.id)}</code><button class="copy-button" data-model-copy="${esc(model.id)}" aria-label="复制模型 ID ${esc(model.id)}">复制</button><button class="copy-button" data-model-config-copy="${esc(model.id)}" aria-label="复制配置 ${esc(model.id)}">复制配置</button></div>${capabilities.length ? `<small class="model-capabilities">${capabilities.join(" · ")}</small>` : ""}${renderModelCapabilities(model)}</div></td>
     <td data-label="消费倍率"><div class="model-rate"><strong>${esc(creditLabel(model.effective_credits))}</strong><small>原始 ${esc(creditLabel(model.credits))}</small></div></td>
+    <td data-label="繁忙程度"><div class="model-busy">${renderModelBusy(model)}</div></td>
     <td data-label="优惠"><div class="model-promotion">${promotionHtml}</div></td>
   </tr>`;
 }

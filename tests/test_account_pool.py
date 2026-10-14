@@ -17,6 +17,8 @@ from test_admin_server import credential
 
 class PoolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        previous = converter.CredentialManager.current()
+        self.addCleanup(converter.CredentialManager.set_current, previous)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.store = Store(root/'management', root/'auth', 'api-test', 'admin-long-enough-test-key')
@@ -137,7 +139,10 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(data['account_status'][self.a]['checkin_date'])
 
     async def test_context_isolation_concurrent_requests_and_auth(self):
+        selected = converter.CredentialManager.current()
         async def app(scope,receive,send):
+            self.assertIs(converter._cred(), REQUEST_CREDENTIAL.get())
+            self.assertIs(converter.CredentialManager.current(), selected)
             before=REQUEST_CREDENTIAL.get().path.name
             await asyncio.sleep(.01)
             after=REQUEST_CREDENTIAL.get().path.name
@@ -151,6 +156,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(set(files)),2)
             self.assertTrue(all(r.json()['before']==r.json()['after'] for r in results))
         self.assertIsNone(REQUEST_CREDENTIAL.get())
+        self.assertIs(converter._cred(), selected)
 
     async def test_sse_error_marks_cooldown_without_replay(self):
         calls=[]

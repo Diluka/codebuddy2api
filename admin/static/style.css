@@ -73,9 +73,10 @@
   table-layout: fixed;
   white-space: normal;
 }
-.model-table th:nth-child(1) { width: 37%; }
-.model-table th:nth-child(2) { width: 19%; }
-.model-table th:nth-child(3) { width: 44%; }
+.model-table th:nth-child(1) { width: 35%; }
+.model-table th:nth-child(2) { width: 15%; }
+.model-table th:nth-child(3) { width: 16%; }
+.model-table th:nth-child(4) { width: 34%; }
 .model-table td { vertical-align: top; }
 .model-table td, .model-table th { padding: 20px; }
 .model-name-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
@@ -136,6 +137,8 @@
   overflow-wrap: anywhere;
 }
 .model-rate small { display: block; margin-top: 6px; color: #8b978f; }
+.model-busy .pill { white-space: nowrap; }
+.model-busy-stale { display: block; margin-top: 6px; color: #9b7a3d; }
 .model-promotion { overflow-wrap: anywhere; }
 .model-promotion .pill { font-size: 10px; }
 .model-promotion-state { font-size: 10px; margin-left: 8px; color: #8b978f; }
@@ -196,4 +199,6 @@
   .model-rate { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 13px; }
   .model-rate small { margin-top: 0; }
   .model-rate strong { font-size: 16px; }
+  .model-busy { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 10px; }
+  .model-busy-stale { margin-top: 0; }
 }

@@ -21,6 +21,8 @@ from .browser_login import BrowserLogin
 from .pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL
 from .metrics import RequestMetrics, MetricsMiddleware
 from core.model_catalog import model_catalog_manager
+from core.model_busy import model_busy_manager
+from core.credentials import CredentialManager
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
@@ -124,7 +126,7 @@ class Store:
                     if current:
                         with current._lock:
                             write_json(self.file_for(item), doc)
-                            current._cached = None
+                            current.cache.invalidate("session")
                     else:
                         write_json(self.file_for(item), doc)
                     if name:
@@ -151,14 +153,17 @@ class Store:
         return path
 
     def sync_active(self):
-        aid = self.data.get("active")
-        item = self.data["accounts"].get(aid)
-        converter.CONFIG["cred"] = self.manager_for(aid, item) if item and item["enabled"] and self.file_for(item).exists() else None
+        with self.lock:
+            aid = self.data.get("active")
+            item = self.data["accounts"].get(aid)
+            credential = self.manager_for(aid, item) if item and item["enabled"] and self.file_for(item).exists() else None
+            if CredentialManager.current() is not credential:
+                CredentialManager.set_current(credential)
 
     def manager_for(self, aid, item):
         with self.lock:
             if aid not in self.managers:
-                self.managers[aid] = converter.CredentialManager(self.file_for(item))
+                self.managers[aid] = CredentialManager(self.file_for(item))
             return self.managers[aid]
 
     def model_account(self):
@@ -169,13 +174,19 @@ class Store:
                 raise HTTPException(400, "请先在账号池选定“手动 / 测试”账号")
             if not item.get("enabled"):
                 raise HTTPException(400, "选定的“手动 / 测试”账号已暂停")
-            return aid, dict(item), self.manager_for(aid, item)
+            credential = CredentialManager.current()
+            if credential is None:
+                raise HTTPException(400, "选定账号的凭据不可用，请重新选择账号")
+            return aid, item, credential
 
     def check_model_account(self, aid, item, credential):
-        current, current_item, current_credential = self.model_account()
-        if current != aid or current_item.get("file") != item.get("file") or current_credential is not credential:
-            raise HTTPException(400, "查询账号已切换，请重新加载模型信息")
-        return {"id": aid, "name": current_item["name"]}
+        with self.lock:
+            current, current_item, current_credential = self.model_account()
+            # Selecting an account replaces its existing record in edit_account.
+            # Compare that record too, so switching A -> B -> A cannot mix results.
+            if current != aid or current_item is not item or current_credential is not credential:
+                raise HTTPException(400, "查询账号已切换，请重新加载模型信息")
+            return {"id": aid, "name": current_item["name"]}
 
     def account_rows(self):
         result = []
@@ -390,11 +401,12 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     async def overview(req: Request):
         store.require_admin(req)
         with store.lock:
-            credential = converter.CONFIG.get("cred")
-        with model_catalog_manager.use_credential(credential):
-            models = await asyncio.to_thread(converter.get_available_models)
+            credential = CredentialManager.current()
+            selected = store.data["accounts"].get(store.data["active"])
+        models = await asyncio.to_thread(converter.get_available_models)
         with store.lock:
-            if converter.CONFIG.get("cred") is not credential:
+            if (CredentialManager.current() is not credential
+                    or store.data["accounts"].get(store.data["active"]) is not selected):
                 raise HTTPException(409, "查询账号已切换，请重新加载")
             keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
             return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": models, "uptime": int(time.time() - store.started), "events": list(store.events)}
@@ -405,7 +417,22 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         aid, item, credential = store.model_account()
         try:
-            result = await asyncio.to_thread(model_catalog_manager.get, credential, force=req.method == "POST")
+            force = req.method == "POST"
+            for attempt in range(2):
+                # Credential locks can be held during token refresh HTTP calls.
+                revision = await asyncio.to_thread(credential.fingerprint)
+                result = await asyncio.to_thread(model_catalog_manager.get, force=force and attempt == 0)
+                store.check_model_account(aid, item, credential)
+                if revision != await asyncio.to_thread(credential.fingerprint):
+                    continue
+                result["models"] = await asyncio.to_thread(model_busy_manager.get, result["models"], force=force and attempt == 0)
+                store.check_model_account(aid, item, credential)
+                if revision == await asyncio.to_thread(credential.fingerprint):
+                    break
+            else:
+                raise HTTPException(400, "登录凭据已变更，请重新加载模型信息")
+        except OSError:
+            raise HTTPException(400, "登录凭据已变更，请重新加载模型信息") from None
         finally:
             # Reject a changed selection even when the remote query itself failed.
             account = store.check_model_account(aid, item, credential)
@@ -557,15 +584,17 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         if store.test_lock.locked():
             raise HTTPException(409, "已有测试正在进行")
         with store.lock:
-            credential = converter.CONFIG.get("cred")
+            credential = CredentialManager.current()
+            selected = store.data["accounts"].get(store.data["active"])
         if credential is None:
             raise HTTPException(400, "请先导入并启用一个账号")
-        with model_catalog_manager.use_credential(credential):
-            models = await asyncio.to_thread(converter.get_available_models)
+        models = await asyncio.to_thread(converter.get_available_models)
+        with store.lock:
+            if (CredentialManager.current() is not credential
+                    or store.data["accounts"].get(store.data["active"]) is not selected):
+                raise HTTPException(409, "测试账号已切换，请重新选择模型")
         if model not in models:
             raise HTTPException(400, "请选择列表中的模型")
-        if converter.CONFIG.get("cred") is not credential:
-            raise HTTPException(409, "测试账号已切换，请重新选择模型")
         if store.test_lock.locked():
             raise HTTPException(409, "已有测试正在进行")
         async with store.test_lock:

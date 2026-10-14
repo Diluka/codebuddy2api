@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfoNotFoundError
 import httpx
 from fastapi import HTTPException
 
-from core.model_catalog import CACHE_TTL, CONFIG_URL, USER_AGENT, ModelCatalogManager, discounted_credits, evaluate_models, promotion_active
+from core.credentials import CredentialManager, WORKBUDDY_USER_AGENT as USER_AGENT
+from core.model_catalog import CACHE_TTL, CONFIG_URL, ModelCatalogManager, discounted_credits, evaluate_models, promotion_active
 
 
 def timestamp(value):
@@ -36,9 +37,9 @@ def config():
             "modelPromotions": [promotion()]}
 
 
-class FakeManager:
+class FakeManager(CredentialManager):
     def __init__(self, path, aid):
-        self.path, self._lock = path, threading.Lock()
+        super().__init__(path)
         path.write_text("synthetic-credential-" + aid)
         self.get_headers = Mock(return_value={"Authorization": "Bearer secret-" + aid,
                                              "X-User-Id": aid, "X-Domain": "www.codebuddy.cn"})
@@ -49,6 +50,8 @@ class CatalogTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.first, self.second = [FakeManager(Path(temporary.name) / (aid + ".info"), aid) for aid in ("a", "b")]
+        self.addCleanup(CredentialManager.set_current, CredentialManager.current())
+        CredentialManager.set_current(self.first)
         self.now = timestamp("2030-01-01T12:00:00+08:00")
         self.requests, self.response = [], {"code": 0, "data": config()}
         self.handler = lambda req: httpx.Response(200, json=self.response)
@@ -57,11 +60,11 @@ class CatalogTests(unittest.TestCase):
             self.requests.append(request)
             return self.handler(request)
 
-        self.manager = ModelCatalogManager(clock=lambda: self.now,
+        self.manager = ModelCatalogManager(clock=lambda: self.now, wall_clock=lambda: self.now,
             client_factory=lambda: httpx.Client(transport=httpx.MockTransport(respond), follow_redirects=True))
 
     def test_fixed_request_never_forwards_credentials_to_redirect_or_foreign_domain(self):
-        result = self.manager.get(self.first)
+        result = self.manager.get()
         request = self.requests[0]
         self.assertEqual((str(request.url), request.method, request.content), (CONFIG_URL, "GET", b""))
         self.assertEqual({key: request.headers[key] for key in ("User-Agent", "X-Product", "X-Requested-With", "Authorization")},
@@ -69,55 +72,60 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual((result["total_models"], result["filtered_models"]), (3, 1))
         self.assertNotIn("secret-a", json.dumps(result))
         self.handler = lambda req: httpx.Response(302, headers={"Location": "https://other.invalid/config"})
-        self.assertEqual(self.manager.get_model_ids(self.second), [])
+        CredentialManager.set_current(self.second)
+        self.assertEqual(self.manager.get_model_ids(), [])
         self.assertEqual([str(req.url) for req in self.requests], [CONFIG_URL, CONFIG_URL])
         self.second.get_headers.return_value["X-Domain"] = "www.workbuddy.ai"
         with self.assertRaises(HTTPException) as error:
-            self.manager.get(self.second)
+            self.manager.get()
         self.assertEqual(error.exception.status_code, 400)
         self.assertEqual(len(self.requests), 2)
 
     def test_metadata_and_ids_share_hour_cache_force_refresh_and_account_isolation(self):
         self.assertEqual(CACHE_TTL, 3600)
-        first = self.manager.get(self.first)
+        first = self.manager.get()
         self.now += CACHE_TTL - 1
-        self.assertEqual(self.manager.get_model_ids(self.first), ["free"])
-        self.assertEqual(self.manager.get(self.first)["fetched_at"], first["fetched_at"])
+        self.assertEqual(self.manager.get_model_ids(), ["free"])
+        self.assertEqual(self.manager.get()["fetched_at"], first["fetched_at"])
         self.assertEqual(len(self.requests), 1)
         self.now += 1
-        self.manager.get(self.first)
-        self.manager.get(self.first, force=True)
-        self.manager.get(self.second)
-        self.manager.get(self.first)
+        self.manager.get()
+        self.manager.get(force=True)
+        CredentialManager.set_current(self.second)
+        self.manager.get()
+        CredentialManager.set_current(self.first)
+        self.manager.get()
         self.assertEqual([req.headers["X-User-Id"] for req in self.requests], ["a", "a", "a", "b"])
 
     def test_failed_refresh_keeps_display_cache_but_ids_and_new_credentials_reject_it(self):
-        first = self.manager.get(self.first)
+        first = self.manager.get()
         self.handler = lambda req: httpx.Response(403, json={"msg": "secret-a raw error"})
-        failed = self.manager.get(self.first, force=True)
+        failed = self.manager.get(force=True)
         self.assertTrue(failed["stale"])
         self.assertEqual((failed["models"], failed["fetched_at"]), (first["models"], first["fetched_at"]))
         self.assertNotIn("secret-a", json.dumps(failed))
-        self.assertEqual(self.manager.get_model_ids(self.first), [])
-        self.assertEqual(self.manager.get_model_ids(self.second), [])
+        self.assertEqual(self.manager.get_model_ids(), [])
+        CredentialManager.set_current(self.second)
+        self.assertEqual(self.manager.get_model_ids(), [])
+        CredentialManager.set_current(self.first)
         self.first.path.write_text("replacement-credential")
         with self.assertRaises(HTTPException):
-            self.manager.get(self.first)
+            self.manager.get()
         self.handler = lambda req: httpx.Response(200, json=self.response)
         self.response["data"]["models"][0]["credits"] = "x3.00"
-        recovered = self.manager.get(self.first)
+        recovered = self.manager.get()
         self.assertFalse(recovered["stale"])
         self.assertEqual(recovered["models"][0]["credits"], "x3.00")
-        self.assertEqual(self.manager.get_model_ids(self.first), ["free"])
+        self.assertEqual(self.manager.get_model_ids(), ["free"])
         self.response["data"]["models"] = []
-        self.manager.get(self.first, force=True)
-        self.assertEqual(self.manager.get_model_ids(self.first), [])
+        self.manager.get(force=True)
+        self.assertEqual(self.manager.get_model_ids(), [])
 
     def test_credential_change_during_request_discards_success_and_failed_refresh(self):
         for status in (200, 500):
             with self.subTest(status=status):
                 self.handler = lambda req: httpx.Response(200, json=self.response)
-                self.manager.get(self.first, force=True)
+                self.manager.get(force=True)
 
                 def changed(request):
                     self.first.path.write_text("changed-during-request-" + str(status))
@@ -125,71 +133,64 @@ class CatalogTests(unittest.TestCase):
 
                 self.handler = changed
                 with self.assertRaises(HTTPException) as error:
-                    self.manager.get(self.first, force=True)
-                self.assertEqual(error.exception.status_code, 400 if status == 200 else 502)
+                    self.manager.get(force=True)
+                self.assertEqual(error.exception.status_code, 400)
 
     def test_token_refresh_retries_headers_once_to_use_stable_credentials(self):
         old_headers = dict(self.first.get_headers.return_value)
         new_headers = {**old_headers, "Authorization": "Bearer replacement-token"}
+        refreshing, waiter_entered = threading.Event(), threading.Event()
 
         def headers():
             if self.first.get_headers.call_count == 1:
+                refreshing.set()
+                self.assertTrue(waiter_entered.wait(2))
                 self.first.path.write_text("refreshed-credential")
                 return old_headers
             return new_headers
 
+        def waiter():
+            waiter_entered.set()
+            return self.manager.get()
+
         self.first.get_headers.side_effect = headers
-        self.manager.get(self.first)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(self.manager.get)
+            self.assertTrue(refreshing.wait(2))
+            second = executor.submit(waiter)
+            result = first.result(2)
+            self.assertEqual(second.result(2), result)
+        self.assertEqual([model["id"] for model in result["models"]], ["free"])
+        self.assertFalse(result["stale"])
+        self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.first.get_headers.call_count, 2)
         self.assertEqual(self.requests[0].headers["Authorization"], "Bearer replacement-token")
 
-    def test_bound_account_and_explicit_none_override_defaults_and_restore_on_exit(self):
-        self.handler = lambda req: httpx.Response(200, json={"data": {"models": [model(req.headers["X-User-Id"])]}})
-        with self.manager.use_credential(self.first):
-            self.assertEqual(self.manager.get_model_ids(self.second), ["a"])
-            with self.assertRaisesRegex(ValueError, "leave context"):
-                with self.manager.use_credential(None):
-                    self.assertEqual(self.manager.get_model_ids(self.second), [])
-                    raise ValueError("leave context")
-            self.assertEqual(self.manager.get_model_ids(self.second), ["a"])
-        self.assertEqual(self.manager.get_model_ids(self.second), ["b"])
-        self.assertEqual(self.manager.get_model_ids(), [])
-        with self.assertRaises(HTTPException):
-            self.manager.get(None)
-        self.assertEqual(len(self.requests), 2)
-
-    def test_concurrent_calls_coalesce_per_account_without_blocking_other_accounts(self):
-        entered, release = threading.Event(), threading.Event()
-
+    def test_current_account_is_resolved_once_and_missing_selection_falls_back(self):
         def respond(request):
-            if request.headers["X-User-Id"] == "a":
-                entered.set()
-                self.assertTrue(release.wait(2))
+            CredentialManager.set_current(self.second)
             return httpx.Response(200, json={"data": {"models": [model(request.headers["X-User-Id"])]}})
 
         self.handler = respond
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            first = executor.submit(self.manager.get_model_ids, self.first)
-            self.assertTrue(entered.wait(2))
-            repeat = executor.submit(self.manager.get_model_ids, self.first)
-            try:
-                other = executor.submit(self.manager.get_model_ids, self.second)
-                self.assertEqual(other.result(1), ["b"])
-            finally:
-                release.set()
-            self.assertEqual(first.result(2), ["a"])
-            self.assertEqual(repeat.result(2), ["a"])
+        with patch.object(CredentialManager, "current", wraps=CredentialManager.current) as current:
+            self.assertEqual(self.manager.get_model_ids(), ["a"])
+            current.assert_called_once_with()
+        self.assertEqual(self.manager.get_model_ids(), ["b"])
+        CredentialManager.set_current(None)
+        self.assertEqual(self.manager.get_model_ids(), [])
+        with self.assertRaises(HTTPException) as error:
+            self.manager.get()
+        self.assertEqual(error.exception.status_code, 400)
         self.assertEqual(len(self.requests), 2)
 
     def test_cached_promotions_recalculate_without_remote_request(self):
         self.response["data"]["modelPromotions"] = [promotion(schedule={"validUntil": "2030-01-01T12:01:00+08:00"})]
-        self.assertEqual(self.manager.get(self.first)["models"][0]["effective_credits"], "0.50x")
+        self.assertEqual(self.manager.get()["models"][0]["effective_credits"], "0.50x")
         self.now += 60
-        result = self.manager.get(self.first)["models"][0]
+        result = self.manager.get()["models"][0]
         self.assertIsNone(result["promotion"])
         self.assertEqual(result["effective_credits"], "x1.00")
         self.assertEqual(len(self.requests), 1)
-
 
 class ModelRulesTests(unittest.TestCase):
     def setUp(self):

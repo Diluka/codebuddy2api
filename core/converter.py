@@ -53,11 +53,7 @@ from .anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
 )
-from .workbuddy_atrest_crypto import (  # issue #23：WorkBuddy 5.6.0 $wbEncrypted 信封
-    decrypt_auth_field,
-    encrypt_auth_field,
-    is_encrypted_field,
-)
+from .credentials import BACKEND, DEFAULT_DOMAIN, USER_AGENT, CredentialManager
 from .responses_adapter import (
     ResponsesStreamConverter,
     responses_request_to_chat,
@@ -65,14 +61,6 @@ from .responses_adapter import (
 from .responses_projection import project_responses_chat_body
 from .system_identity import filter_system_identity
 from .model_catalog import model_catalog_manager
-
-# ---------------------------------------------------------------------------
-# 常量
-# ---------------------------------------------------------------------------
-
-BACKEND = "https://copilot.tencent.com"
-DEFAULT_DOMAIN = "www.codebuddy.cn"
-USER_AGENT = "codebuddy2openai/2.0"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -114,130 +102,6 @@ def find_auth_file() -> Path | None:
                 return current
             return max(files, key=lambda p: p.stat().st_mtime)
     return None
-
-
-# ---------------------------------------------------------------------------
-# Auth 凭据管理（读 + 自动刷新 + 回写）
-# ---------------------------------------------------------------------------
-
-
-class CredentialManager:
-    """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._lock = threading.Lock()
-        self._cached: dict | None = None
-        self._mtime: float = 0.0
-
-    def _read_raw(self) -> dict:
-        with open(self.path, encoding="utf-8") as f:
-            return json.load(f)
-
-    def _load_if_stale(self):
-        """若文件 mtime 变了（外部刷新过），重新加载缓存。"""
-        try:
-            mt = self.path.stat().st_mtime
-        except OSError:
-            return
-        if self._cached is None or mt != self._mtime:
-            self._cached = self._read_raw()
-            self._mtime = mt
-
-    def _session(self) -> dict:
-        self._load_if_stale()
-        if self._cached is None:
-            raise RuntimeError(f"无法读取 auth 文件：{self.path}")
-        return self._cached
-
-    def _is_expired(self) -> bool:
-        s = self._session()
-        expires_at = (s.get("auth") or {}).get("expiresAt") or 0
-        # 提前 60s 判定过期
-        return time.time() * 1000 >= (expires_at - 60_000)
-
-    def _refresh(self):
-        """调后端刷新 token，写回 auth 文件与缓存。"""
-        s = self._session()
-        auth = s.get("auth") or {}
-        headers = self._build_headers_from(auth, s.get("account") or {})
-        headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
-        headers["X-Auth-Refresh-Source"] = "plugin"
-        url = f"{BACKEND}/v2/plugin/auth/token/refresh"
-        try:
-            with httpx.Client(timeout=15) as c:
-                r = c.post(url, headers=headers, json={})
-            data = r.json()
-        except Exception as e:
-            raise RuntimeError(f"刷新 token 网络失败：{e}")
-        if data.get("code") != 0 or not data.get("data"):
-            raise RuntimeError(f"刷新 token 失败：{data.get('msg', data)}")
-        new_auth = data["data"]
-        if not isinstance(new_auth, dict) or not new_auth.get("accessToken"):
-            raise RuntimeError("刷新响应缺少访问令牌")
-        # 继承部分字段（refreshToken 兜底取解密后的旧值，避免加密信封被二次加密）
-        new_auth["refreshToken"] = new_auth.get("refreshToken") or decrypt_auth_field(
-            auth.get("refreshToken", "")
-        )
-        new_auth["domain"] = new_auth.get("domain") or auth.get("domain")
-        new_auth["lastRefreshTime"] = int(time.time() * 1000)
-        # 计算 expiresAt（若后端没直接给）
-        if not new_auth.get("expiresAt") and new_auth.get("expiresIn"):
-            new_auth["expiresAt"] = (
-                int(time.time() * 1000) + new_auth["expiresIn"] * 1000
-            )
-        if not new_auth.get("refreshExpiresAt") and new_auth.get("refreshExpiresIn"):
-            new_auth["refreshExpiresAt"] = (
-                int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
-            )
-        s["auth"] = new_auth
-        # issue #23：若原文件为 $wbEncrypted 加密格式，回写前必须重新加密，
-        # 否则 WorkBuddy 客户端读到明文会报 integrity 错误、可能重置登录态。
-        if is_encrypted_field(auth.get("accessToken")):
-            new_auth["accessToken"] = encrypt_auth_field(decrypt_auth_field(new_auth["accessToken"]))
-            new_auth["refreshToken"] = encrypt_auth_field(decrypt_auth_field(new_auth["refreshToken"]))
-        # 原子写回
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
-        self._cached = s
-        self._mtime = self.path.stat().st_mtime
-
-    def _build_headers_from(self, auth: dict, account: dict) -> dict:
-        domain = auth.get("domain") or DEFAULT_DOMAIN
-        h = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {decrypt_auth_field(auth.get('accessToken', ''))}",
-            "X-User-Id": account.get("uid", ""),
-            "X-Enterprise-Id": account.get("enterpriseId", ""),
-            "X-Tenant-Id": account.get("enterpriseId", ""),
-            "X-Domain": domain,
-            "User-Agent": USER_AGENT,
-        }
-        return h
-
-    def get_headers(self) -> dict:
-        """返回带最新 token 的后端请求 header；必要时先刷新。"""
-        with self._lock:
-            if self._is_expired():
-                self._refresh()
-            s = self._session()
-            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
-
-    def summary(self) -> dict:
-        s = self._session()
-        auth = s.get("auth") or {}
-        acct = s.get("account") or {}
-        exp = auth.get("expiresAt", 0)
-        return {
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "enterpriseName": acct.get("enterpriseName"),
-            "token_expires_at": exp,
-            "token_expired": self._is_expired(),
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +253,7 @@ def _load_models_from_workbuddy() -> list[str]:
 
 def _load_models_from_remote() -> list[str]:
     """从共享远端模型管理器读取列表，不可用时返回空列表。"""
-    # cred 是当前账号的 CredentialManager；请求已绑定账号时优先使用绑定值。
-    return model_catalog_manager.get_model_ids(CONFIG.get("cred"))
+    return model_catalog_manager.get_model_ids()
 
 
 def get_available_models() -> list[str]:
@@ -444,11 +307,10 @@ PASSTHROUGH_BODY_KEYS = {
 app = FastAPI(title="codebuddy2openai", version="2.0")
 CONFIG: dict = {
     "api_key": "",
-    "cred": None,
     "log_path": None,
     "desensitize": False,
     "no_compact": False,
-}  # cred: CredentialManager | None
+}
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +364,8 @@ def _cred() -> CredentialManager:
             return selected
     except ImportError:
         pass
-    if CONFIG["cred"] is None:
+    credential = CredentialManager.current()
+    if credential is None:
         raise HTTPException(
             status_code=503,
             detail={
@@ -512,12 +375,12 @@ def _cred() -> CredentialManager:
                 }
             },
         )
-    return CONFIG["cred"]
+    return credential
 
 
 @app.get("/health")
 def health():
-    cred = CONFIG["cred"]
+    cred = CredentialManager.current()
     info: dict = {
         "status": "ok",
         "platform": sys.platform,
@@ -1560,7 +1423,7 @@ def main():
         args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
     )
     af = find_auth_file()
-    CONFIG["cred"] = CredentialManager(af) if af else None
+    CredentialManager.set_current(CredentialManager(af) if af else None)
 
     if not args.skip_check:
         preflight()

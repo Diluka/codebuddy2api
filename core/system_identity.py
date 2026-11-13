@@ -1,4 +1,4 @@
-"""Remove client identity declarations from system/developer text only."""
+"""Normalize client runtime declarations in system/developer text only."""
 
 import re
 
@@ -27,12 +27,21 @@ _HEADINGS = re.compile(
 _BRANCH_TEMPLATE = re.compile(
     r"Main branch \(you will usually use this for PRs\):", re.IGNORECASE
 )
+_PATH_REFERENCE = re.compile(
+    r"^Tokens prefixed with @ are paths the user explicitly referenced\.(?=\s|$)"
+)
 
 
 def filter_system_text(text: str) -> str:
     lines = []
     for line in text.splitlines(keepends=True):
         candidate = re.sub(r"^\s*(?:[-*]\s+|#{1,6}\s+)?", "", line)
+        prefix_length = len(line) - len(candidate)
+        # Keep the harness path syntax and all following file-handling rules.
+        candidate = _PATH_REFERENCE.sub(
+            "A leading @ marks a path explicitly referenced by the user.", candidate
+        )
+        line = line[:prefix_length] + candidate
         # Limit removal to declarative sentences. Keep subsequent instructions.
         pieces = re.split(r"(?<=[.!?。！？])(?=\s|$)", candidate)
         kept = []

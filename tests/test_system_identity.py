@@ -5,6 +5,44 @@ import pytest
 from core.system_identity import filter_system_identity, filter_system_text
 
 
+PATH_REFERENCE = 'Tokens prefixed with @ are paths the user explicitly referenced.'
+PATH_RULES = (
+    ' Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.'
+    ' A trailing slash marks a directory: list it when its contents matter.'
+    ' Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading.'
+    ' @"..." quotes a path containing spaces.'
+)
+
+
+def test_runtime_path_declaration_preserves_all_path_rules():
+    text = '  - ' + PATH_REFERENCE + PATH_RULES + '\n\nKeep repository instructions.\n'
+    assert filter_system_text(text) == (
+        '  - A leading @ marks a path explicitly referenced by the user.'
+        + PATH_RULES + '\n\nKeep repository instructions.\n'
+    )
+
+
+def test_runtime_path_declaration_only_changes_instruction_roles():
+    import json
+
+    text = PATH_REFERENCE + PATH_RULES
+    body = {'messages': [
+        {'role': 'system', 'content': [{'type': 'text', 'text': text}]},
+        {'role': 'developer', 'content': text},
+        *[{'role': role, 'content': text} for role in ('user', 'assistant', 'tool')],
+        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'call_1', 'type': 'function',
+         'function': {'name': 'write', 'arguments': json.dumps({'text': text})}}]},
+    ], 'tools': [{'type': 'function', 'function': {'name': 'write', 'description': text,
+               'parameters': {'type': 'object', 'properties': {'text': {'type': 'string'}}}}}]}
+    original = copy.deepcopy(body)
+    result = filter_system_identity(body)
+    assert body == original
+    assert result['messages'][0]['content'][0]['text'] == filter_system_text(text)
+    assert result['messages'][1]['content'] == filter_system_text(text)
+    assert result['messages'][2:] == original['messages'][2:]
+    assert result['tools'] == original['tools']
+
+
 @pytest.mark.parametrize('identity', [
     'You are ZCode, an interactive coding agent.',
     'You are a coding agent running in the Codex CLI.',
@@ -49,7 +87,8 @@ def test_identity_only_system_is_removed():
 
 
 @pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses', '/v1/messages'])
-def test_routes_filter_system_but_preserve_harness_user(monkeypatch, path):
+@pytest.mark.parametrize('desensitize', [False, True])
+def test_routes_filter_system_but_preserve_harness_user(monkeypatch, path, desensitize):
     import asyncio
     import json
     import httpx
@@ -64,12 +103,12 @@ def test_routes_filter_system_but_preserve_harness_user(monkeypatch, path):
     monkeypatch.setattr(converter, '_check_auth', lambda *a: None)
     monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}})())
     monkeypatch.setattr(converter, '_log', lambda *a: None)
-    monkeypatch.setitem(converter.CONFIG, 'desensitize', True)
+    monkeypatch.setitem(converter.CONFIG, 'desensitize', desensitize)
     monkeypatch.setitem(converter.CONFIG, 'no_compact', False)
     monkeypatch.delenv('CODEBUDDY_LOSSY_PROJECTION', raising=False)
     monkeypatch.delenv('CODEBUDDY_RESPONSES_DESENSITIZE', raising=False)
-    user = '<system-reminder>\nYou are Claude Code. sandbox credential testing\n</system-reminder>'
-    system = 'You are ZCode.\nKeep project rules.\nMain branch (you will usually use this for PRs): main'
+    user = '<system-reminder>\nYou are Claude Code. sandbox credential testing\n' + PATH_REFERENCE + PATH_RULES + '\n</system-reminder>'
+    system = 'You are ZCode.\nKeep project rules.\nMain branch (you will usually use this for PRs): main\n' + PATH_REFERENCE + PATH_RULES
     body = {'model': 'test', 'stream': False}
     if path.endswith('responses'):
         body.update(instructions=system, input=user)
@@ -88,3 +127,6 @@ def test_routes_filter_system_but_preserve_harness_user(monkeypatch, path):
     assert 'ZCode' not in system_text
     assert 'Main branch: main' in system_text
     assert 'Keep project rules.' in system_text
+    assert 'A leading @ marks a path explicitly referenced by the user.' in system_text
+    assert PATH_REFERENCE not in system_text
+    assert PATH_RULES in system_text

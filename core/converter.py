@@ -657,6 +657,21 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         }
 
 
+def _upstream_error(raw: bytes, status: int) -> dict:
+    """Keep upstream business details separate from the HTTP transport status."""
+    payload = _safe_err_raw(raw, status)
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        payload = payload["error"]
+    if not isinstance(payload, dict):
+        payload = {"message": raw.decode("utf-8", "replace")[:500]}
+    error = dict(payload)
+    error["message"] = error.get("message") or error.get("msg") or json.dumps(payload, ensure_ascii=False)
+    error.setdefault("type", "upstream_error")
+    error.setdefault("code", status)
+    error["http_status"] = status
+    return error
+
+
 async def _stream_upstream(
     url: str,
     headers: dict,
@@ -764,16 +779,8 @@ def _safe_err(r: httpx.Response) -> dict:
 
 def _err_event(msg: bytes, status: int) -> bytes:
     # 以 OpenAI SSE 错误 chunk 形式返回
-    import json as _json
-
-    chunk = {
-        "error": {
-            "message": msg.decode("utf-8", "replace")[:500],
-            "type": "upstream_error",
-            "code": status,
-        },
-    }
-    return f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+    chunk = {"error": _upstream_error(msg, status)}
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
 
 def _looks_like_content_filter_text(text: str) -> bool:
@@ -984,7 +991,7 @@ async def _stream_responses(
                 if response.status_code != 200:
                     raw = await response.aread()
                     _log(f"{prefix}✗ HTTP {response.status_code} | {model_name}")
-                    yield converter.error(raw.decode("utf-8", "replace")[:500], response.status_code).encode("utf-8")
+                    yield converter.error(**_upstream_error(raw, response.status_code)).encode("utf-8")
                     return
                 async for line in response.aiter_lines():
                     if line.strip():
@@ -1136,13 +1143,7 @@ async def _collect_anthropic_nonstream(
                     )
                     raise HTTPException(
                         status_code=r.status_code,
-                        detail={
-                            "error": {
-                                "message": err.decode("utf-8", "replace")[:500],
-                                "type": "api_error",
-                                "code": r.status_code,
-                            }
-                        },
+                        detail={"error": {**_upstream_error(err, r.status_code), "type": "api_error"}},
                     )
                 async for line in r.aiter_lines():
                     converter.feed_line(line)
@@ -1182,11 +1183,7 @@ async def _stream_anthropic(
                     )
                     error_evt = {
                         "type": "error",
-                        "error": {
-                            "message": err.decode("utf-8", "replace")[:500],
-                            "type": "api_error",
-                            "code": r.status_code,
-                        },
+                        "error": {**_upstream_error(err, r.status_code), "type": "api_error"},
                     }
                     yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
                     return
@@ -1292,13 +1289,7 @@ async def count_tokens(
                     )
                     raise HTTPException(
                         status_code=resp.status_code,
-                        detail={
-                            "error": {
-                                "message": err.decode("utf-8", "replace")[:500],
-                                "type": "api_error",
-                                "code": resp.status_code,
-                            }
-                        },
+                        detail={"error": {**_upstream_error(err, resp.status_code), "type": "api_error"}},
                     )
 
                 # 解析 SSE 流，查找 usage 信息

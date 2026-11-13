@@ -369,7 +369,7 @@ class ResponsesStreamConverter:
         if chunk.get("error"):
             error = chunk["error"]
             if isinstance(error, dict):
-                return self.error(error.get("message", str(error)), error.get("code", "upstream_error"))
+                return self.error(**{"message": str(error), "code": "upstream_error", **error})
             return self.error(str(error), "upstream_error")
 
         # 模型名
@@ -465,10 +465,10 @@ class ResponsesStreamConverter:
 
         return "".join(events)
 
-    def error(self, message: str, code) -> str:
+    def error(self, message: str, code, **metadata) -> str:
         if self._error or self._finished:
             return ""
-        self._error = {"message": message, "code": str(code), "type": "upstream_error"}
+        self._error = {"type": "upstream_error", **metadata, "message": message, "code": str(code)}
         return self._evt("response.failed", {"response": self._response_obj("failed")})
 
     def _evt(self, event_type: str, data: dict) -> str:

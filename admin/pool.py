@@ -372,7 +372,7 @@ class PoolMiddleware:
                         try:
                             obj = json.loads(line[5:])
                             err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
-                            code = err.get("code") if isinstance(err, dict) else None
+                            code = err.get("http_status", err.get("code")) if isinstance(err, dict) else None
                             if isinstance(code, str) and code.isdigit():
                                 code = int(code)
                             if code in (401, 402, 403, 429):
